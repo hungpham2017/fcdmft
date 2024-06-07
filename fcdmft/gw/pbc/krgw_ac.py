@@ -224,6 +224,30 @@ def get_rho_response(gw, omega, mo_energy, Lpq, kL, kidx):
         Pi += 4./nkpts * einsum('Pia,Qia->PQ',Pia,Lpq[i][:,:nocc,nocc:].conj())
     return Pi
 
+def get_rho_response_outcore(gw, omega, mo_energy, Lpq_file, naux, kL, kidx):
+    '''
+    Compute density response function in auxiliary basis at freq iw
+    (for gapped systems with integer occupations)
+    '''
+    nocc = gw.nocc
+    kpts = gw.kpts
+    nkpts = len(kpts)
+    kscaled = gw.mol.get_scaled_kpts(kpts)
+    kscaled -= kscaled[0]
+
+    # Compute Pi for kL
+    Pi = np.zeros((naux,naux),dtype=np.complex128)
+    for i, kpti in enumerate(kpts):
+        # Find ka that conserves with ki and kL (-ki+ka+kL=G)
+        a = kidx[i]
+        eia = mo_energy[i,:nocc,None] - mo_energy[a,None,nocc:]
+        eia = eia/(omega**2+eia*eia)
+        Lpq = Lpq_file[f"Lij_kL{kL}_ki{i}"][()]
+        Pia = einsum('Pia,ia->Pia',Lpq[:,:nocc,nocc:],eia)
+        # Response from both spin-up and spin-down density
+        Pi += 4./nkpts * einsum('Pia,Qia->PQ',Pia,Lpq[:,:nocc,nocc:].conj())
+    return Pi
+
 def get_rho_response_metal(gw, omega, mo_energy, mo_occ, Lpq, kL, kidx):
     '''
     Compute density response function in auxiliary basis at freq iw
@@ -247,6 +271,34 @@ def get_rho_response_metal(gw, omega, mo_energy, mo_occ, Lpq, kL, kidx):
         Pia = einsum('Pia,ia->Pia',Lpq[i],eia)
         # Response from both spin-up and spin-down density
         Pi += 2./nkpts * einsum('Pia,Qia->PQ',Pia,Lpq[i].conj())
+    return Pi
+
+def get_rho_response_metal_outcore(gw, omega, mo_energy, mo_occ, Lpq_file, naux, kL, kidx):
+    '''
+    Compute density response function in auxiliary basis at freq iw
+    (for metallic systems with fractional occupations)
+    '''
+    nocc = gw.nocc
+    kpts = gw.kpts
+    nkpts = len(kpts)
+    kscaled = gw.mol.get_scaled_kpts(kpts)
+    kscaled -= kscaled[0]
+    mo_occ = [x/2. for x in mo_occ]
+
+    # Compute Pi for kL
+    Pi = np.zeros((naux,naux),dtype=np.complex128)
+    for i, kpti in enumerate(kpts):
+        # Find ka that conserves with ki and kL (-ki+ka+kL=G)
+        a = kidx[i]
+        eia = mo_energy[i,:,None] - mo_energy[a,None,:]
+        fia = mo_occ[i][:,None] - mo_occ[a][None,:]
+        eia = eia*fia/(omega**2+eia*eia)
+        Lpq = Lpq_file[f"Lij_kL{kL}_ki{i}"][()]
+        Pia = einsum('Pia,ia->Pia',Lpq,eia)
+        
+        # Response from both spin-up and spin-down density
+        Pi += 2./nkpts * einsum('Pia,Qia->PQ',Pia,Lpq.conj())
+        
     return Pi
 
 def get_sigma_diag(gw, orbs, kptlist, freqs, wts, iw_cutoff=None, max_memory=8000):
@@ -495,6 +547,24 @@ def get_rho_response_wing(gw, omega, mo_energy, Lpq, qij):
         eia = eia/(omega**2+eia*eia)
         eia_q = eia * qij[i].conj()
         Pi += 4./nkpts * einsum('Pia,ia->P',Lpq[i][:,:nocc,nocc:],eia_q)
+    return Pi
+
+def get_rho_response_wing_outcore(gw, omega, mo_energy, Lpq_file, naux, qij):
+    '''
+    Compute wing (G=P, G'=0) density response function in auxiliary basis at freq iw
+    '''
+    nocc = gw.nocc
+    kpts = gw.kpts
+    nkpts = len(kpts)
+
+    # Compute Pi wing
+    Pi = np.zeros(naux,dtype=np.complex128)
+    for i, kpti in enumerate(kpts):
+        eia = mo_energy[i,:nocc,None] - mo_energy[i,None,nocc:]
+        eia = eia/(omega**2+eia*eia)
+        eia_q = eia * qij[i].conj()
+        Lpq = Lpq_file[f"Lij_kL{kL}_ki{i}"][()]
+        Pi += 4./nkpts * einsum('Pia,ia->P',Lpq[:,:nocc,nocc:],eia_q)
     return Pi
 
 def get_qij(gw, q, mo_coeff, uniform_grids=False):

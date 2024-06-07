@@ -27,7 +27,7 @@ Method:
 '''
 
 from functools import reduce
-import time, h5py, os
+import time, h5py, os, sys
 import numpy
 import numpy as np
 from scipy.optimize import newton, least_squares
@@ -42,7 +42,8 @@ from pyscf import __config__
 
 from fcdmft.gw.mol.gw_ac import _get_scaled_legendre_roots
 from fcdmft.gw.pbc.krgw_ac import get_rho_response, get_rho_response_metal, \
-                get_rho_response_head, get_rho_response_wing, get_qij
+                get_rho_response_outcore, get_rho_response_metal_outcore, \
+                get_rho_response_head, get_rho_response_wing, get_rho_response_wing_outcore, get_qij
 from mpi4py import MPI
 
 rank = MPI.COMM_WORLD.Get_rank()
@@ -163,10 +164,14 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
         for k in range(nq_pts):
             qij[k] = get_qij(rpa, q_abs[k], mo_coeff)
 
-    e_corr = 0j
+            
+    # Compute Lij at eack kL then write them to disk
+    filename = rpa.outcore_filename + f"_Lij_rank{rank}.h5"
+    Lij_file = lib.H5TmpFile(filename=filename)
+    e_corr = 0
+    kidx_kL = {}
+    naux_kL = {}
     for kL in range(start,stop):
-        # Lij: (ki, L, i, j) for looping every kL
-        Lij = []
         # kidx: save kj that conserves with kL and ki (-ki+kj+kL=G)
         # kidx_r: save ki that conserves with kL and kj (-ki+kj+kL=G)
         kidx = np.zeros((nkpts),dtype=np.int64)
@@ -190,27 +195,41 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                     tao = []
                     ao_loc = None
                     moij, ijslice = _conc_mos(mo_coeff[i], mo_coeff[j])[2:]
-                    Lij_out = _ao2mo.r_e2(Lpq, moij, ijslice, tao, ao_loc, out=Lij_out)           
-                    Lij.append(Lij_out.reshape(-1,nmo,nmo))
+                    Lij_out = _ao2mo.r_e2(Lpq, moij, ijslice, tao, ao_loc, out=Lij_out)
+                    Lij_out = Lij_out.reshape(-1,nmo,nmo)
+                    naux_kL[kL] = Lij_out.shape[0]
                     
-        Lij = np.asarray(Lij)
-        naux = Lij.shape[1]
-        
+                    # Write to disk:
+                    logger.debug(rpa, "Write Lij (kL: %s / %s, ki: %s @ Rank %d)"%(kL+1, nkpts, i, rank))
+                    dset_name = f"Lij_kL{kL}_ki{i}"
+                    Lij_file.create_dataset(dset_name, data=Lij_out)
+                    
+        kidx_kL[kL] = kidx
+    Lij_file.close()        
+    
+    # Compute the RPA correlation
+    e_corr = 0
+    Lij_file = h5py.File(filename, 'r')
+    for kL in range(start,stop):
+        logger.debug(rpa, "Compute RPA e_corr contribution at kL: %s / %s @ Rank %d)"%(kL+1, nkpts, rank))
+        kidx = kidx_kL[kL]
+        naux = naux_kL[kL]
         if kL == 0:
             for w in range(nw):
                 # body polarizability
                 if is_metal:
-                    Pi = get_rho_response_metal(rpa, freqs[w], mo_energy, mo_occ, Lij, kL, kidx)
+                    Pi = get_rho_response_metal_outcore(rpa, freqs[w], mo_energy, mo_occ, Lij_file, naux, kL, kidx)
                 else:
-                    Pi = get_rho_response(rpa, freqs[w], mo_energy, Lij, kL, kidx)
+                    Pi = get_rho_response_outcore(rpa, freqs[w], mo_energy, Lij_file, naux, kL, kidx)
 
+                # HP: Haven't touch this yet
                 if rpa.fc:
                     for iq in range(nq_pts):
                         # head Pi_00
                         Pi_00 = get_rho_response_head(rpa, freqs[w], mo_energy, qij[iq])
                         Pi_00 = 4. * np.pi/np.linalg.norm(q_abs[iq])**2 * Pi_00
                         # wings Pi_P0
-                        Pi_P0 = get_rho_response_wing(rpa, freqs[w], mo_energy, Lij, qij[iq])
+                        Pi_P0 = get_rho_response_wing_outcore(rpa, freqs[w], mo_energy, Lij, naux, qij[iq])
                         Pi_P0 = np.sqrt(4.*np.pi) / np.linalg.norm(q_abs[iq]) * Pi_P0
 
                         # assemble Pi
@@ -230,12 +249,14 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
         else:
             for w in range(nw):
                 if is_metal:
-                    Pi = get_rho_response_metal(rpa, freqs[w], mo_energy, mo_occ, Lij, kL, kidx)
+                    Pi = get_rho_response_metal_outcore(rpa, freqs[w], mo_energy, mo_occ, Lij_file, naux, kL, kidx)
                 else:
-                    Pi = get_rho_response(rpa, freqs[w], mo_energy, Lij, kL, kidx)
+                    Pi = get_rho_response_outcore(rpa, freqs[w], mo_energy, Lij_file, naux, kL, kidx)
                 ec_w = np.log(np.linalg.det(np.eye(naux) - Pi))
                 ec_w += np.trace(Pi)
                 e_corr += 1./(2.*np.pi) * 1./nkpts * ec_w * wts[w]
+                
+    Lij_file.close()
     comm.Barrier()
     ecorr_gather = comm.gather(e_corr)
     if rank == 0:
@@ -282,6 +303,7 @@ class KRPA(lib.StreamObject):
         self.e_hf = None
         self.e_tot = None
         self.fc_grid = False
+        self.outcore_filename = ''
 
         keys = set(('fc'))
         self._keys = set(self.__dict__.keys()).union(keys)
