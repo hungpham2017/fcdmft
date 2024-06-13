@@ -332,7 +332,7 @@ def get_rho_response_metal_outcore(gw, omega, mo_energy, mo_occ, Lpq_file, naux,
         
     return Pi
 
-
+import time
 def get_rho_response_metal_outcore_gpu(gw, omega, mo_energy, mo_occ, Lpq_file, naux, kidx):
     '''
     Compute density response function in auxiliary basis at freq iw
@@ -344,11 +344,9 @@ def get_rho_response_metal_outcore_gpu(gw, omega, mo_energy, mo_occ, Lpq_file, n
     kscaled = gw.mol.get_scaled_kpts(kpts)
     kscaled -= kscaled[0]
     mo_occ = cp.asarray([x/2. for x in mo_occ])
-
+    
     # Compute Pi for kL
     Pi = cp.zeros((naux,naux),dtype=np.complex128)
-    Lpq = Lpq_file[f"Lij_ki{0}"][()]
-    Lpq_gpu = cp.asarray(Lpq)
     for i, kpti in enumerate(kpts):
         # Find ka that conserves with ki and kL (-ki+ka+kL=G)
         a = kidx[i]
@@ -356,11 +354,15 @@ def get_rho_response_metal_outcore_gpu(gw, omega, mo_energy, mo_occ, Lpq_file, n
         fia = mo_occ[i][:,None] - mo_occ[a][None,:]
         eia = eia*fia/(omega**2+eia*eia)
         Lpq = Lpq_file[f"Lij_ki{i}"][()]
-        Lpq_gpu[:] = cp.asarray(Lpq)
+        Lpq_gpu = cp.asarray(Lpq)
         Pia = culib.contraction('Pia', Lpq_gpu,'ia', eia, 'Pia', alpha=1.0)
         
         # Response from both spin-up and spin-down density
         culib.contraction('Pia', Pia,'Qia', Lpq_gpu,'PQ', Pi, alpha=2./nkpts, beta=1.0, opb="CONJ")
+
+        # Delete Pia to free memory
+        del Pia
+        cp.get_default_memory_pool().free_all_blocks()  # Free all blocks in the memory pool
         
     return Pi
 
