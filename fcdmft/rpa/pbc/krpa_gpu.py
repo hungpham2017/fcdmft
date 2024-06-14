@@ -27,8 +27,7 @@ Method:
 '''
 
 from functools import reduce
-import time, h5py, os, sys, time
-import tempfile
+import time, h5py, os
 import numpy
 import numpy as np
 from scipy.optimize import newton, least_squares
@@ -43,10 +42,8 @@ from pyscf import __config__
 
 from fcdmft.gw.mol.gw_ac import _get_scaled_legendre_roots
 from fcdmft.gw.pbc.krgw_ac import get_rho_response, get_rho_response_metal, \
-                get_rho_response_outcore_gpu, get_rho_response_metal_outcore_gpu, \
-                get_rho_response_head, get_rho_response_head_gpu, \
-                get_rho_response_wing, get_rho_response_wing_outcore, get_rho_response_wing_outcore_gpu, \
-                get_qij, get_qij_gpu
+                get_rho_response_gpu, get_rho_response_metal_gpu, \
+                get_rho_response_head, get_rho_response_wing, get_qij
 from mpi4py import MPI
 import cupy as cp
 
@@ -93,7 +90,7 @@ def kernel(rpa, mo_energy, mo_coeff, nw=None, verbose=logger.NOTE):
             logger.info(rpa, 'Computed EXX energy = %s', e_hf)
         comm.Barrier()
         e_hf = comm.bcast(e_hf, root=0)
-    
+
     # check metal
     mo_occ_1d = np.array(mo_occ).reshape(-1)
     is_metal = False
@@ -184,26 +181,29 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                             q_pts[i*Nq**2+j*Nq+k-1,2] = i * 5e-4
         nq_pts = len(q_pts)
         q_abs = rpa.mol.get_abs_kpts(q_pts)
-        q_abs = cp.asarray(q_abs)
-        
-        # Get qij = 1/sqrt(Omega) * < psi_{ik} | e^{iqr} | psi_{ak-q} > at q: (nkpts, nocc, nvir)
-        qij = cp.zeros((nq_pts, nkpts, nocc, nmo - nocc),dtype=np.complex128)
-        for k in range(nq_pts):
-            qij[k] = get_qij_gpu(rpa, q_abs[k], mo_coeff)
 
-    # Compute Lij at eack kL then write them to disk
-    for kL in range(start,stop):
-        filename = rpa.outcore_filename + f"_Lij_kL{kL}.h5"
-        if os.path.isfile(filename):
-            continue
-        Lij_file = h5py.File(filename, 'w') 
-        
+        # Get qij = 1/sqrt(Omega) * < psi_{ik} | e^{iqr} | psi_{ak-q} > at q: (nkpts, nocc, nvir)
+        qij = np.zeros((nq_pts, nkpts, nocc, nmo - nocc),dtype=np.complex128)
+        for k in range(nq_pts):
+            qij[k] = get_qij(rpa, q_abs[k], mo_coeff)
+            
+    comm.Barrier()
+    e_corr = 0j
+    for kL in range(nkpts):
+        if rank == 0:
+            cput0 = (time.process_time(), time.perf_counter())
+
+        # Lij: (ki, L, i, j) for looping every kL
+        Lij = {}
         # kidx: save kj that conserves with kL and ki (-ki+kj+kL=G)
         # kidx_r: save ki that conserves with kL and kj (-ki+kj+kL=G)
         kidx = np.zeros((nkpts),dtype=np.int64)
         kidx_r = np.zeros((nkpts),dtype=np.int64)
         naux = None
-        for i, kpti in enumerate(kpts):
+            
+        for i in range(start,stop):
+            logger.debug(rpa, "    Read and Tranform Lpq at kL: %s / %s @ rank %d"%(kL+1, nkpts, rank))
+            kpti = kpts[i]
             for j, kptj in enumerate(kpts):
                 # Find (ki,kj) that satisfies momentum conservation with kL
                 kconserv = -kscaled[i] + kscaled[j] + kscaled[kL]
@@ -211,7 +211,6 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                 if is_kconserv:
                     kidx[i] = j
                     kidx_r[j] = i
-                    logger.debug(rpa, "Read and Write Lpq (kL: %s / %s, ki: %s, kj: %s @ Rank %d)"%(kL+1, nkpts, i, j, rank))
                     Lij_out = None
                     # Read (L|pq) and ao2mo transform to (L|ij)
                     Lpq = []
@@ -222,77 +221,81 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                     tao = []
                     ao_loc = None
                     moij, ijslice = _conc_mos(mo_coeff[i].get(), mo_coeff[j].get())[2:]
-                    Lij_out = _ao2mo.r_e2(Lpq, moij, ijslice, tao, ao_loc, out=Lij_out)
-                    Lij_out = Lij_out.reshape(-1,nmo,nmo)
+                    Lij_out = _ao2mo.r_e2(Lpq, moij, ijslice, tao, ao_loc, out=Lij_out)           
+                    Lij[f"k{i}"] = Lij_out.reshape(-1,nmo,nmo)
                     naux = Lij_out.shape[0]
-
-                    # Write to disk:
-                    dset_name = f"Lij_ki{i}"
-                    Lij_file.create_dataset(dset_name, data=Lij_out)
-
-        Lij_file.create_dataset(f"naux", data=naux)
-        Lij_file.create_dataset(f"kidx", data=kidx)
-        Lij_file.close()        
-
-    comm.Barrier()
-    if rank == 0:
-        logger.info(rpa, "Read and Write Lpq: Finished")
-        
-    # Compute the RPA correlation
-    e_corr = 0
-    for kL in range(start,stop):
-        logger.debug(rpa, "Compute RPA e_corr contribution at kL: %s / %s @ Rank %d GPU %d)"%(kL+1, nkpts, rank, gpu_id)) 
-        Lij_file = h5py.File(filename, 'r')
-        kidx = Lij_file[f"kidx"][()]
-        naux = Lij_file[f"naux"][()]
+        comm.Barrier()
+        if rank == 0:
+            logger.timer(rpa, "Read and Tranform Lpq at kL: %s / %s" % (kL+1, nkpts), *cput0)
+            
         if kL == 0:
+            if rank == 0:
+                cput0 = (time.process_time(), time.perf_counter())
+                logger.info(rpa, "  Compute the e_corr contribution at kL: %s / %s"%(kL+1, nkpts))
+
             for w in range(nw):
                 # body polarizability
                 if is_metal:
-                    Pi = get_rho_response_metal_outcore_gpu(rpa, freqs[w], mo_energy, mo_occ, Lij_file, naux, kidx)
+                    Pi = get_rho_response_metal_gpu(rpa, freqs[w], mo_energy, mo_occ, Lij, kidx, start, stop)
                 else:
-                    Pi = get_rho_response_outcore_gpu(rpa, freqs[w], mo_energy, Lij_file, naux, kidx)
-                
+                    Pi = get_rho_response_gpu(rpa, freqs[w], mo_energy, Lij, kL, kidx)
+    
+                # comm.Barrier()
+                if rank == 0:
+                    summed_Pi = np.zeros((naux, naux), dtype=np.complex128)
+                else:
+                    summed_Pi = None
+                comm.Reduce(Pi.get(), summed_Pi, op=MPI.SUM, root=0)
+
                 if rpa.fc:
                     for iq in range(nq_pts):
                         # head Pi_00
-                        Pi_00 = get_rho_response_head_gpu(rpa, freqs[w], mo_energy, qij[iq])
-                        Pi_00 = 4. * cp.pi/cp.linalg.norm(q_abs[iq])**2 * Pi_00
+                        Pi_00 = get_rho_response_head(rpa, freqs[w], mo_energy, qij[iq])
+                        Pi_00 = 4. * np.pi/np.linalg.norm(q_abs[iq])**2 * Pi_00
                         # wings Pi_P0
-                        Pi_P0 = get_rho_response_wing_outcore_gpu(rpa, freqs[w], mo_energy, Lij_file, naux, qij[iq])
-                        Pi_P0 = cp.sqrt(4.*cp.pi) / cp.linalg.norm(q_abs[iq]) * Pi_P0
+                        Pi_P0 = get_rho_response_wing(rpa, freqs[w], mo_energy, Lij, qij[iq])
+                        Pi_P0 = np.sqrt(4.*np.pi) / np.linalg.norm(q_abs[iq]) * Pi_P0
 
                         # assemble Pi
-                        Pi_fc = cp.zeros((naux+1,naux+1),dtype=Pi.dtype)
+                        Pi_fc = np.zeros((naux+1,naux+1),dtype=Pi.dtype)
                         Pi_fc[0,0] = Pi_00
                         Pi_fc[0,1:] = Pi_P0.conj()
                         Pi_fc[1:,0] = Pi_P0
                         Pi_fc[1:,1:] = Pi
 
-                        ec_w = cp.log(cp.linalg.det(cp.eye(1+naux) - Pi_fc))
-                        ec_w += cp.trace(Pi_fc)
-                        e_corr += 1./(2.*cp.pi) * 1./nkpts * 1./nq_pts * ec_w * wts[w]
+                        ec_w = np.log(np.linalg.det(np.eye(1+naux) - Pi_fc))
+                        ec_w += np.trace(Pi_fc)
+                        e_corr += 1./(2.*np.pi) * 1./nkpts * 1./nq_pts * ec_w * wts[w]
                 else:
-                    ec_w = cp.log(cp.linalg.det(cp.eye(naux) - Pi))
-                    ec_w += cp.trace(Pi)
-                    e_corr += 1./(2.*cp.pi) * 1./nkpts * ec_w * wts[w]
+                    if rank == 0:
+                        Pi = cp.asarray(summed_Pi)
+                        ec_w = cp.log(cp.linalg.det(cp.eye(naux) - Pi))
+                        ec_w += cp.trace(Pi)
+                        e_corr += 1./(2.*cp.pi) * 1./nkpts * ec_w * wts[w]
         else:
             for w in range(nw):
                 if is_metal:
-                    Pi = get_rho_response_metal_outcore_gpu(rpa, freqs[w], mo_energy, mo_occ, Lij_file, naux, kidx)
+                    Pi = get_rho_response_metal_gpu(rpa, freqs[w], mo_energy, mo_occ, Lij, kidx, start, stop)
                 else:
-                    Pi = get_rho_response_outcore_gpu(rpa, freqs[w], mo_energy, Lij_file, naux, kidx)
-                ec_w = cp.log(cp.linalg.det(cp.eye(naux) - Pi))
-                ec_w += cp.trace(Pi)
-                e_corr += 1./(2.*cp.pi) * 1./nkpts * ec_w * wts[w]
+                    Pi = get_rho_response_gpu(rpa, freqs[w], mo_energy, Lij, kL, kidx)
+                    
+                # comm.Barrier()
+                if rank == 0:
+                    summed_Pi = np.zeros((naux, naux), dtype=np.complex128)
+                else:
+                    summed_Pi = None
+                comm.Reduce(Pi.get(), summed_Pi, op=MPI.SUM, root=0)
                 
-        Lij_file.close()
-    comm.Barrier()
-    ecorr_gather = comm.gather(e_corr.get())
-    if rank == 0:
-        e_corr = np.sum(ecorr_gather)
-    comm.Barrier()
-    e_corr = comm.bcast(e_corr,root=0)
+                if rank == 0:
+                    Pi = cp.asarray(summed_Pi)
+                    ec_w = cp.log(cp.linalg.det(cp.eye(naux) - Pi))
+                    ec_w += cp.trace(Pi)
+                    e_corr += 1./(2.*cp.pi) * 1./nkpts * ec_w * wts[w]
+        comm.Barrier()
+        e_corr = comm.bcast(e_corr,root=0)
+        if rank == 0:
+            logger.debug(rpa, "  kL = %s / %s, RPA corr energy = %s"%(kL+1, nkpts, e_corr.real))
+            logger.timer(rpa, "the corr energy contribution at kL: %s / %s" % (kL+1, nkpts), *cput0)
 
     return e_corr.real
 
@@ -333,10 +336,6 @@ class KRPA(lib.StreamObject):
         self.e_hf = None
         self.e_tot = None
         self.fc_grid = False
-        self.outcore_filename = ''
-        # filename to self.chkfile
-        self._chkfile = tempfile.NamedTemporaryFile(dir=lib.param.TMPDIR)
-        self.chkfile = self._chkfile.name
 
         keys = set(('fc'))
         self._keys = set(self.__dict__.keys()).union(keys)
