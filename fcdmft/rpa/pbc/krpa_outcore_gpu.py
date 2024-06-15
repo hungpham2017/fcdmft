@@ -44,9 +44,9 @@ from pyscf import __config__
 from fcdmft.gw.mol.gw_ac import _get_scaled_legendre_roots
 from fcdmft.gw.pbc.krgw_ac import get_rho_response, get_rho_response_metal, \
                 get_rho_response_outcore_gpu, get_rho_response_metal_outcore_gpu, \
-                get_rho_response_head, get_rho_response_head_gpu, \
+                get_rho_response_head, get_rho_response_head_outcore_gpu, \
                 get_rho_response_wing, get_rho_response_wing_outcore, get_rho_response_wing_outcore_gpu, \
-                get_qij, get_qij_gpu
+                get_qij, get_qij_outcore_gpu
 from mpi4py import MPI
 import cupy as cp
 
@@ -189,10 +189,11 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
         # Get qij = 1/sqrt(Omega) * < psi_{ik} | e^{iqr} | psi_{ak-q} > at q: (nkpts, nocc, nvir)
         qij = cp.zeros((nq_pts, nkpts, nocc, nmo - nocc),dtype=np.complex128)
         for k in range(nq_pts):
-            qij[k] = get_qij_gpu(rpa, q_abs[k], mo_coeff)
+            qij[k] = get_qij_outcore_gpu(rpa, q_abs[k], mo_coeff)
 
     # Compute Lij at eack kL then write them to disk
     for kL in range(start,stop):
+        cput0 = (time.process_time(), time.perf_counter())
         filename = rpa.outcore_filename + f"_Lij_kL{kL}.h5"
         if os.path.isfile(filename):
             continue
@@ -232,19 +233,23 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
 
         Lij_file.create_dataset(f"naux", data=naux)
         Lij_file.create_dataset(f"kidx", data=kidx)
-        Lij_file.close()        
+        Lij_file.close()          
+        logger.timer(rpa, "Read and Tranform Lpq at kL: %s / %s" % (kL+1, nkpts), *cput0)
 
     comm.Barrier()
     if rank == 0:
         logger.info(rpa, "Read and Write Lpq: Finished")
         
     # Compute the RPA correlation
+    cput0 = (time.process_time(), time.perf_counter())
     e_corr = 0
     for kL in range(start,stop):
-        logger.debug(rpa, "Compute RPA e_corr contribution at kL: %s / %s @ Rank %d GPU %d)"%(kL+1, nkpts, rank, gpu_id)) 
+        logger.debug(rpa, "  Compute RPA e_corr contribution at kL: %s / %s @ Rank %d)"%(kL+1, nkpts, rank)) 
+        filename = rpa.outcore_filename + f"_Lij_kL{kL}.h5"
         Lij_file = h5py.File(filename, 'r')
         kidx = Lij_file[f"kidx"][()]
         naux = Lij_file[f"naux"][()]
+        
         if kL == 0:
             for w in range(nw):
                 # body polarizability
@@ -256,7 +261,7 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                 if rpa.fc:
                     for iq in range(nq_pts):
                         # head Pi_00
-                        Pi_00 = get_rho_response_head_gpu(rpa, freqs[w], mo_energy, qij[iq])
+                        Pi_00 = get_rho_response_head_outcore_gpu(rpa, freqs[w], mo_energy, qij[iq])
                         Pi_00 = 4. * cp.pi/cp.linalg.norm(q_abs[iq])**2 * Pi_00
                         # wings Pi_P0
                         Pi_P0 = get_rho_response_wing_outcore_gpu(rpa, freqs[w], mo_energy, Lij_file, naux, qij[iq])
@@ -285,9 +290,11 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                 ec_w = cp.log(cp.linalg.det(cp.eye(naux) - Pi))
                 ec_w += cp.trace(Pi)
                 e_corr += 1./(2.*cp.pi) * 1./nkpts * ec_w * wts[w]
-                
         Lij_file.close()
+        
     comm.Barrier()
+    logger.debug(rpa, "  rank = %d, RPA corr energy = %s"%(rank, e_corr.real))
+    logger.timer(rpa, "the corr energy contribution at rank: %d" % rank, *cput0)
     ecorr_gather = comm.gather(e_corr.get())
     if rank == 0:
         e_corr = np.sum(ecorr_gather)

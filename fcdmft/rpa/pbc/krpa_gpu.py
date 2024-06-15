@@ -43,7 +43,9 @@ from pyscf import __config__
 from fcdmft.gw.mol.gw_ac import _get_scaled_legendre_roots
 from fcdmft.gw.pbc.krgw_ac import get_rho_response, get_rho_response_metal, \
                 get_rho_response_gpu, get_rho_response_metal_gpu, \
-                get_rho_response_head, get_rho_response_wing, get_qij
+                get_rho_response_head, get_rho_response_head_gpu, \
+                get_rho_response_wing, get_rho_response_wing_gpu, \
+                get_qij, get_qij_gpu
 from mpi4py import MPI
 import cupy as cp
 
@@ -180,12 +182,12 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                             q_pts[i*Nq**2+j*Nq+k-1,1] = j * 5e-4
                             q_pts[i*Nq**2+j*Nq+k-1,2] = i * 5e-4
         nq_pts = len(q_pts)
-        q_abs = rpa.mol.get_abs_kpts(q_pts)
+        q_abs = cp.asarray(rpa.mol.get_abs_kpts(q_pts))
 
         # Get qij = 1/sqrt(Omega) * < psi_{ik} | e^{iqr} | psi_{ak-q} > at q: (nkpts, nocc, nvir)
-        qij = np.zeros((nq_pts, nkpts, nocc, nmo - nocc),dtype=np.complex128)
+        qij = cp.zeros((nq_pts, nkpts, nocc, nmo - nocc),dtype=np.complex128)
         for k in range(nq_pts):
-            qij[k] = get_qij(rpa, q_abs[k], mo_coeff)
+            qij[k] = get_qij_gpu(rpa, q_abs[k], mo_coeff, start, stop)
             
     comm.Barrier()
     e_corr = 0j
@@ -202,7 +204,7 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
         naux = None
             
         for i in range(start,stop):
-            logger.debug(rpa, "    Read and Tranform Lpq at kL: %s / %s @ rank %d"%(kL+1, nkpts, rank))
+            logger.debug(rpa, "    Read and Tranform Lpq (kL: %s / %s, ki: %s) @ rank %d"%(kL+1, nkpts, i, rank))
             kpti = kpts[i]
             for j, kptj in enumerate(kpts):
                 # Find (ki,kj) that satisfies momentum conservation with kL
@@ -238,35 +240,52 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                 if is_metal:
                     Pi = get_rho_response_metal_gpu(rpa, freqs[w], mo_energy, mo_occ, Lij, kidx, start, stop)
                 else:
-                    Pi = get_rho_response_gpu(rpa, freqs[w], mo_energy, Lij, kL, kidx)
-    
-                # comm.Barrier()
-                if rank == 0:
-                    summed_Pi = np.zeros((naux, naux), dtype=np.complex128)
-                else:
-                    summed_Pi = None
-                comm.Reduce(Pi.get(), summed_Pi, op=MPI.SUM, root=0)
+                    Pi = get_rho_response_gpu(rpa, freqs[w], mo_energy, Lij, kidx, start, stop)
 
                 if rpa.fc:
                     for iq in range(nq_pts):
                         # head Pi_00
-                        Pi_00 = get_rho_response_head(rpa, freqs[w], mo_energy, qij[iq])
-                        Pi_00 = 4. * np.pi/np.linalg.norm(q_abs[iq])**2 * Pi_00
+                        Pi_00 = get_rho_response_head_gpu(rpa, freqs[w], mo_energy, qij[iq])
+                        Pi_00 = 4. * cp.pi/cp.linalg.norm(q_abs[iq])**2 * Pi_00
                         # wings Pi_P0
-                        Pi_P0 = get_rho_response_wing(rpa, freqs[w], mo_energy, Lij, qij[iq])
-                        Pi_P0 = np.sqrt(4.*np.pi) / np.linalg.norm(q_abs[iq]) * Pi_P0
-
-                        # assemble Pi
-                        Pi_fc = np.zeros((naux+1,naux+1),dtype=Pi.dtype)
-                        Pi_fc[0,0] = Pi_00
-                        Pi_fc[0,1:] = Pi_P0.conj()
-                        Pi_fc[1:,0] = Pi_P0
-                        Pi_fc[1:,1:] = Pi
-
-                        ec_w = np.log(np.linalg.det(np.eye(1+naux) - Pi_fc))
-                        ec_w += np.trace(Pi_fc)
-                        e_corr += 1./(2.*np.pi) * 1./nkpts * 1./nq_pts * ec_w * wts[w]
+                        Pi_P0 = get_rho_response_wing_gpu(rpa, freqs[w], mo_energy, Lij, qij[iq], start, stop)
+                        Pi_P0 = cp.sqrt(4.*cp.pi) / cp.linalg.norm(q_abs[iq]) * Pi_P0
+                        comm.Barrier()
+                        
+                        if rank == 0:
+                            summed_Pi = np.zeros((naux, naux), dtype=np.complex128)
+                            summed_Pi_P0 = np.zeros(naux, dtype=np.complex128)
+                        else:
+                            summed_Pi = None
+                            summed_Pi_P0 = None
+                            
+                        comm.Reduce(Pi.get(), summed_Pi, op=MPI.SUM, root=0)
+                        comm.Reduce(Pi_P0.get(), summed_Pi_P0, op=MPI.SUM, root=0)
+                        Pi_00_gather = comm.gather(Pi_00.get())
+    
+                        if rank == 0:
+                            Pi_00 = np.sum(Pi_00_gather)
+                            Pi_P0 = cp.asarray(summed_Pi_P0)
+                            Pi = cp.asarray(summed_Pi)
+                            
+                            # assemble Pi
+                            Pi_fc = cp.zeros((naux+1,naux+1),dtype=Pi.dtype)
+                            Pi_fc[0,0] = Pi_00
+                            Pi_fc[0,1:] = Pi_P0.conj()
+                            Pi_fc[1:,0] = Pi_P0
+                            Pi_fc[1:,1:] = Pi
+                        
+                            ec_w = cp.log(cp.linalg.det(cp.eye(1+naux) - Pi_fc))
+                            ec_w += cp.trace(Pi_fc)
+                            e_corr += 1./(2.*cp.pi) * 1./nkpts * 1./nq_pts * ec_w * wts[w]
                 else:
+                    comm.Barrier()
+                    if rank == 0:
+                        summed_Pi = np.zeros((naux, naux), dtype=np.complex128)
+                    else:
+                        summed_Pi = None
+                    comm.Reduce(Pi.get(), summed_Pi, op=MPI.SUM, root=0)
+
                     if rank == 0:
                         Pi = cp.asarray(summed_Pi)
                         ec_w = cp.log(cp.linalg.det(cp.eye(naux) - Pi))
@@ -277,7 +296,7 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                 if is_metal:
                     Pi = get_rho_response_metal_gpu(rpa, freqs[w], mo_energy, mo_occ, Lij, kidx, start, stop)
                 else:
-                    Pi = get_rho_response_gpu(rpa, freqs[w], mo_energy, Lij, kL, kidx)
+                    Pi = get_rho_response_gpu(rpa, freqs[w], mo_energy, Lij, kidx, start, stop)
                     
                 # comm.Barrier()
                 if rank == 0:

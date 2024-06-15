@@ -176,6 +176,7 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
 
     # Compute Lij at eack kL then write them to disk
     for kL in range(start,stop):
+        cput0 = (time.process_time(), time.perf_counter())
         filename = rpa.outcore_filename + f"_Lij_kL{kL}.h5"
         if os.path.isfile(filename):
             continue
@@ -194,7 +195,7 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                 if is_kconserv:
                     kidx[i] = j
                     kidx_r[j] = i
-                    logger.debug(rpa, "Read and Write Lpq (kL: %s / %s, ki: %s, kj: %s @ Rank %d)"%(kL+1, nkpts, i, j, rank))
+                    logger.debug(rpa, "    Read and Write Lpq (kL: %s / %s, ki: %s, kj: %s @ Rank %d)"%(kL+1, nkpts, i, j, rank))
                     Lij_out = None
                     # Read (L|pq) and ao2mo transform to (L|ij)
                     Lpq = []
@@ -204,7 +205,7 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                     Lpq = np.vstack(Lpq).reshape(-1,nmo**2)
                     tao = []
                     ao_loc = None
-                    moij, ijslice = _conc_mos(mo_coeff[i].get(), mo_coeff[j].get())[2:]
+                    moij, ijslice = _conc_mos(mo_coeff[i], mo_coeff[j])[2:]
                     Lij_out = _ao2mo.r_e2(Lpq, moij, ijslice, tao, ao_loc, out=Lij_out)
                     Lij_out = Lij_out.reshape(-1,nmo,nmo)
                     naux = Lij_out.shape[0]
@@ -216,18 +217,23 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
         Lij_file.create_dataset(f"naux", data=naux)
         Lij_file.create_dataset(f"kidx", data=kidx)
         Lij_file.close()        
+        logger.timer(rpa, "Read and Tranform Lpq at kL: %s / %s" % (kL+1, nkpts), *cput0)
 
     comm.Barrier()
+    comm.Barrier()
     if rank == 0:
-        logger.info(rpa, "Read and Write Lpq: Finished")
+        logger.info(rpa, "    Read and Write Lpq: Finished")
         
     # Compute the RPA correlation
+    cput0 = (time.process_time(), time.perf_counter())
     e_corr = 0
     for kL in range(start,stop):
-        logger.debug(rpa, "Compute RPA e_corr contribution at kL: %s / %s @ Rank %d)"%(kL+1, nkpts, rank)) 
+        logger.debug(rpa, "  Compute RPA e_corr contribution at kL: %s / %s @ Rank %d)"%(kL+1, nkpts, rank)) 
+        filename = rpa.outcore_filename + f"_Lij_kL{kL}.h5"
         Lij_file = h5py.File(filename, 'r')
         kidx = Lij_file[f"kidx"][()]
         naux = Lij_file[f"naux"][()]
+        
         if kL == 0:
             for w in range(nw):
                 # body polarizability
@@ -267,10 +273,12 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
                     Pi = get_rho_response_outcore(rpa, freqs[w], mo_energy, Lij_file, naux, kidx)
                 ec_w = np.log(np.linalg.det(np.eye(naux) - Pi))
                 ec_w += np.trace(Pi)
-                e_corr += 1./(2.*np.pi) * 1./nkpts * ec_w * wts[w]
-                
+                e_corr += 1./(2.*np.pi) * 1./nkpts * ec_w * wts[w]                
         Lij_file.close()
+        
     comm.Barrier()
+    logger.debug(rpa, "  rank = %d, RPA corr energy = %s"%(rank, e_corr.real))
+    logger.timer(rpa, "the corr energy contribution at rank: %d" % rank, *cput0)
     ecorr_gather = comm.gather(e_corr)
     if rank == 0:
         e_corr = np.sum(ecorr_gather)
