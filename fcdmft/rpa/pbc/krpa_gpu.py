@@ -48,6 +48,7 @@ from fcdmft.gw.pbc.krgw_ac import get_rho_response, get_rho_response_metal, \
                 get_qij, get_qij_gpu
 from mpi4py import MPI
 import cupy as cp
+from pyscf.lib import chkfile
 
 rank = MPI.COMM_WORLD.Get_rank()
 size = MPI.COMM_WORLD.Get_size()
@@ -77,22 +78,34 @@ def kernel(rpa, mo_energy, mo_coeff, nw=None, verbose=logger.NOTE):
     if rpa.e_hf:
         if rank == 0:
             logger.info(rpa, 'Given EXX energy = %s', rpa.e_hf)
+            if rpa.chkfile:
+                chkfile.dump(rpa.chkfile, 'e_hf', rpa.e_hf)
         e_hf = rpa.e_hf
     else:
-        e_hf = 0
-        if rank == 0:
-            dm = mf.make_rdm1()
-            rhf = scf.KRHF(rpa.mol, rpa.kpts, exxdiv=mf.exxdiv)
-            if hasattr(rpa._scf, 'sigma'):
-                rhf = scf.addons.smearing_(rhf, sigma=rpa._scf.sigma, method="fermi")
-            rhf.with_df = mf.with_df
-            rhf.with_df._cderi = mf.with_df._cderi
-            e_hf = rhf.energy_elec(dm)[0]
-            e_hf += mf.energy_nuc()
-            logger.info(rpa, 'Computed EXX energy = %s', e_hf)
-        comm.Barrier()
-        e_hf = comm.bcast(e_hf, root=0)
-
+        e_hf = None
+        if os.path.exists(rpa.chkfile):
+            e_hf = chkfile.load(rpa.chkfile, 'e_hf')
+ 
+        if e_hf is None:
+            e_hf = 0
+            if rank == 0:
+                dm = mf.make_rdm1()
+                rhf = scf.KRHF(rpa.mol, rpa.kpts, exxdiv=mf.exxdiv)
+                if hasattr(rpa._scf, 'sigma'):
+                    rhf = scf.addons.smearing_(rhf, sigma=rpa._scf.sigma, method="fermi")
+                rhf.with_df = mf.with_df
+                rhf.with_df._cderi = mf.with_df._cderi
+                e_hf = rhf.energy_elec(dm)[0]
+                e_hf += mf.energy_nuc()
+                logger.info(rpa, 'Computed EXX energy = %s', e_hf)
+                if rpa.chkfile:
+                    chkfile.dump(rpa.chkfile, 'e_hf', e_hf)
+            comm.Barrier()
+            e_hf = comm.bcast(e_hf, root=0)
+        else:
+            if rank == 0:
+                logger.info(rpa, 'Saved EXX energy = %s', e_hf)
+            
     # check metal
     mo_occ_1d = np.array(mo_occ).reshape(-1)
     is_metal = False
@@ -192,6 +205,15 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
     comm.Barrier()
     e_corr = 0j
     for kL in range(nkpts):
+        if os.path.exists(rpa.chkfile):
+            tmp = chkfile.load(rpa.chkfile, f"e_corr at kL{kL}")
+            if tmp:
+                e_corr = tmp
+                if rank == 0:
+                    logger.debug(rpa, "  kL = %s / %s, RPA corr energy = %s"%(kL+1, nkpts, e_corr.real))
+                continue
+            comm.Barrier()
+            
         if rank == 0:
             cput0 = (time.process_time(), time.perf_counter())
 
@@ -313,9 +335,12 @@ def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
         comm.Barrier()
         e_corr = comm.bcast(e_corr,root=0)
         if rank == 0:
+            if rpa.chkfile:
+                chkfile.dump(rpa.chkfile, f"e_corr at kL{kL}", e_corr.get())
             logger.debug(rpa, "  kL = %s / %s, RPA corr energy = %s"%(kL+1, nkpts, e_corr.real))
             logger.timer(rpa, "the corr energy contribution at kL: %s / %s" % (kL+1, nkpts), *cput0)
-
+        comm.Barrier()
+        
     return e_corr.real
 
 class KRPA(lib.StreamObject):
